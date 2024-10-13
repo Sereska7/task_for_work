@@ -1,4 +1,8 @@
 import asyncio
+
+import requests
+import websockets
+import json
 from datetime import datetime
 from typing import Optional
 
@@ -6,7 +10,6 @@ import jwt
 import uvicorn
 from fastapi import FastAPI, Request, Depends, HTTPException, Response
 from fastapi.security import OAuth2PasswordBearer
-from httpx import AsyncClient
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import (
     Integer,
@@ -50,14 +53,14 @@ async def init_db():
         await conn.run_sync(Base.metadata.create_all)
 
 
-async def get_user(**data: dict):
+async def get_user(**data: str | int):
     async with session_factory() as session:
         request = select(User).filter_by(**data)
         user = await session.execute(request)
         return user.scalar_one_or_none()
 
 
-async def get_users(**data: dict):
+async def get_users(**data: str | int | bool):
     async with session_factory() as session:
         request = select(User).filter_by(**data)
         users = await session.execute(request)
@@ -67,7 +70,7 @@ async def get_users(**data: dict):
 async def lifespan(app: FastAPI):
     # start
     await init_db()
-    asyncio.create_task(fetch_prices())
+    asyncio.create_task(binance_ws())
     yield
     # stop
 
@@ -145,68 +148,94 @@ async def create_alert(
     }
 
 
-async def get_price(currency: str):
-    async with AsyncClient() as client:
-        response = await client.get(
-            f"https://api.coingecko.com/api/v3/simple/price?ids={currency}&vs_currencies=usd"
-        )
-    return response.json().get(currency, {}).get("usd", None)
+# Эндпоинт для получения вебхуков о ценах
+@main_app.post("/webhook/price_update")
+async def price_update(request: Request):
+    payload = await request.json()
+
+    currency_pair = payload.get("currency_pair")
+    new_price = payload.get("new_price")
+
+    if not currency_pair or new_price is None:
+        return {"status": "error", "message": "Некорректные данные"}
+
+    print(f"Получен вебхук: пара {currency_pair}, новая цена: {new_price}")
+
+    # Логика для уведомления пользователей или записи в базу данных
+    return {"status": "success", "message": f"Цена {currency_pair} обновлена"}
 
 
-async def fetch_prices():
-    # Инициализируем пустой словарь для хранения предыдущих цен
-    previous_prices = {
-        "BTC-USD": None,
-        "ETH-USD": None,
-        "USDTERC-USD": None,
-        "USDTTRC-USD": None,
+webhook_url = "http://localhost:8000/webhook/price_update"
+socket = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/usdtercusdt@trade/usdttrcusdt@trade"
+
+previous_prices = {
+        "BTCUSDT": None,
+        "ETHUSDT": None,
+        "USDTERCUSDT": None,
+        "USDTTRCUSDT": None,
     }
-    while True:
-        new_prices = {
-            "BTC-USD": await get_price("bitcoin"),
-            "ETH-USD": await get_price("ethereum"),
-            "USDTERC-USD": await get_price("usd-coin"),
-            "USDTTRC-USD": await get_price("tether"),
-        }
 
-        for pair, new_price in new_prices.items():
-            previous_price = previous_prices.get(pair)
-            if previous_price is None:
-                previous_prices[pair] = new_price
-                continue
-        users = await get_users()
-        for user in users:
-            if user.get_BTC_USD and new_prices['BTC-USD'] != previous_prices['BTC-USD']:
-                print(
-                    f"Уведомление пользователю: {user.email}"
-                    f"Изменение цены 'BTC-USD'!"
-                    f"Старая цена: {previous_prices['BTC-USD']} Новая цена: {new_prices['BTC-USD']}"
-                )
-            if user.get_ETH_USD and new_prices['ETH-USD'] != previous_prices['ETH-USD']:
-                print(
-                    f"Уведомление пользователю: {user.email}"
-                    f"Изменение цены 'ETH-USD'!"
-                    f"Старая цена: {previous_prices['ETH-USD']} Новая цена: {new_prices['ETH-USD']}"
-                )
-            if (
-                user.get_USDTERC_USD
-                and new_prices['USDTERC-USD'] != previous_prices['USDTERC-USD']
-            ):
-                print(
-                    f"Уведомление пользователю: {user.email}"
-                    f"Изменение цены 'USDTERC-USD'!"
-                    f"Старая цена: {previous_prices['USDTERC-USD']} Новая цена: {new_prices['USDTERC-USD']}"
-                )
-            if (
-                user.get_USDTTRC_USD
-                and new_prices['USDTTRC-USD'] != previous_prices['USDTTRC-USD']
-            ):
-                print(
-                    f"Уведомление пользователю: {user.email} "
-                    f"Изменение цены 'USDTTRC-USD'! "
-                    f"Старая цена: {previous_prices['USDTTRC-USD']} Новая цена: {new_prices['USDTTRC-USD']}"
-                )
-        await asyncio.sleep(60)
+
+# Функция для отправки вебхука на сервер
+def send_webhook(currency_pair: str, new_price: float):
+    data = {
+        "currency_pair": currency_pair,
+        "new_price": new_price
+    }
+    response = requests.post(webhook_url, json=data)
+    if response.status_code == 200:
+        print(f"Вебхук для {currency_pair} успешно отправлен.")
+    else:
+        print(f"Ошибка при отправке вебхука: {response.status_code}")
+
+
+# Функция для отправки уведомления пользователям (например, через e-mail или Telegram)
+async def notify_user(user_email: str, currency_pair: str, old_price: float, new_price: float):
+    message = (f"Уведомление пользователю: {user_email}\n"
+               f"Цена для {currency_pair} изменилась с {old_price} на {new_price}")
+    print(message)
+
+
+async def binance_ws():
+    while True:
+        try:
+            async with websockets.connect(socket) as websocket:
+                data = await websocket.recv()
+                stream_data = json.loads(data)
+                if 'data' in stream_data:
+                    stream = stream_data['data']
+
+                    # Получаем название валютной пары (BTCUSDT, ETHUSDT и т.д.)
+                    trading_pair = stream.get('s')  # Валютная пара
+                    new_price = stream.get('p')  # Новая цена
+
+                    if trading_pair and new_price:
+                        new_price = float(new_price)  # Преобразуем строку в число
+                        previous_price = previous_prices.get(trading_pair)
+
+                        if previous_price is None:
+                            previous_prices[trading_pair] = new_price
+                        else:
+                            if new_price != previous_price:
+                                print(f"Цена {trading_pair} изменилась с {previous_price} на {new_price}")
+                                # send_webhook(trading_pair, new_price)
+
+                                users = await get_users()
+                                for user in users:
+                                    if trading_pair == "BTCUSDT" and user.get_BTC_USD:
+                                        await notify_user(user.email, trading_pair, previous_price, new_price)
+                                    if trading_pair == "ETHUSDT" and user.get_ETH_USD:
+                                        await notify_user(user.email, trading_pair, previous_price, new_price)
+                                    if trading_pair == "USDTERCUSDT" and user.get_USDTERC_USD:
+                                        await notify_user(user.email, trading_pair, previous_price, new_price)
+                                    if trading_pair == "USDTTRCUSDT" and user.get_USDTTRC_USD:
+                                        await notify_user(user.email, trading_pair, previous_price, new_price)
+                                # Обновляем предыдущую цену
+                                previous_prices[trading_pair] = new_price
+        except websockets.ConnectionClosed:
+            # Обработка ошибок соединения и переподключение
+            print("Соединение потеряно, пытаемся переподключиться...")
+            await asyncio.sleep(5)
 
 
 if __name__ == "__main__":

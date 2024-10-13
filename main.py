@@ -8,6 +8,7 @@ import uvicorn
 from fastapi import FastAPI, Request, Depends, HTTPException, Response
 from fastapi.security import OAuth2PasswordBearer
 from httpx import AsyncClient
+from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import (
     Integer,
@@ -45,10 +46,54 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=True, index=True)
 
 
+class SUserLog(BaseModel):
+    email: EmailStr
+    password: str
+
+
 async def init_db():
     async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
         # Асинхронный вызов создания всех таблиц
         await conn.run_sync(Base.metadata.create_all)
+
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def get_password_hash(password: str):
+    return pwd_context.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str):
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+async def authenticate_user(data_user: SUserLog):
+    user = await get_user(email=data_user.email)
+    if not user:
+        raise HTTPException(status_code=404, detail="Not found")
+    else:
+        if not verify_password(data_user.password, user.password):
+            raise HTTPException(status_code=400)
+    return user
+
+
+async def add_user():
+    data = [
+        {"email": "user_1@example.com", "password": "password", "created_at": datetime.now()},
+        {"email": "user_2@example.com", "password": "password", "created_at": datetime.now()}
+    ]
+    async with session_factory() as session:
+        for person in data:
+            user = User(
+                email=person["email"],
+                password=get_password_hash(person["password"]),
+                created_at=person["created_at"]
+            )
+            session.add(user)
+            await session.commit()
+            return user
 
 
 async def get_user(**data: dict):
@@ -81,6 +126,7 @@ async def get_users_for_pair(trading_pair: str):
 async def lifespan(app: FastAPI):
     # start
     await init_db()
+    await add_user()
     logging.basicConfig(level=logging.WARNING)
     asyncio.create_task(fetch_prices())
     yield
@@ -111,19 +157,9 @@ async def get_current_user(token: Optional[str] = Depends(get_token_from_request
     return user
 
 
-class SUserLog(BaseModel):
-    email: EmailStr
-    password: str
-
-
 @main_app.post("/login")
 async def login_user(user_data: SUserLog, response: Response):
-    user = await get_user(email=user_data.email)
-    if not user:
-        raise HTTPException(status_code=404)
-
-    if user.password != user_data.password:
-        raise HTTPException(status_code=500)
+    user = await authenticate_user(user_data)
 
     access_token = await create_access_token({"sub": str(user.id)})
     response.set_cookie("access_token", access_token, httponly=True)

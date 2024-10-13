@@ -1,11 +1,10 @@
 import asyncio
 import logging
 
-import requests
 import websockets
 import json
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Optional, Dict
 
 import jwt
 import uvicorn
@@ -19,6 +18,7 @@ from sqlalchemy import (
     select,
     Boolean
 )
+from passlib.context import CryptContext
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column, declarative_base
 
@@ -50,10 +50,54 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=True, index=True)
 
 
+class SUserLog(BaseModel):
+    email: EmailStr
+    password: str
+
+
 async def init_db():
     async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
         # Асинхронный вызов создания всех таблиц
         await conn.run_sync(Base.metadata.create_all)
+
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def get_password_hash(password: str):
+    return pwd_context.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str):
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+async def authenticate_user(data_user: SUserLog):
+    user = await get_user(email=data_user.email)
+    if not user:
+        raise HTTPException(status_code=404, detail="Not found")
+    else:
+        if not verify_password(data_user.password, user.password):
+            raise HTTPException(status_code=400)
+    return user
+
+
+async def add_user():
+    data = [
+        {"email": "user_1@example.com", "password": "password", "created_at": datetime.now()},
+        {"email": "user_2@example.com", "password": "password", "created_at": datetime.now()}
+    ]
+    async with session_factory() as session:
+        for person in data:
+            user = User(
+                email=person["email"],
+                password=get_password_hash(person["password"]),
+                created_at=person["created_at"]
+            )
+            session.add(user)
+            await session.commit()
+            return user
 
 
 async def get_user(**data: str | int):
@@ -86,7 +130,8 @@ async def get_users_for_pair(trading_pair: str):
 async def lifespan(app: FastAPI):
     # start
     await init_db()
-    logging.basicConfig(level=logging.INFO)
+    await add_user()
+    logging.basicConfig(level=logging.WARNING)
     asyncio.create_task(binance_ws())
     yield
     # stop
@@ -116,19 +161,9 @@ async def get_current_user(token: Optional[str] = Depends(get_token_from_request
     return user
 
 
-class SUserLog(BaseModel):
-    email: EmailStr
-    password: str
-
-
 @main_app.post("/login")
 async def login_user(user_data: SUserLog, response: Response):
-    user = await get_user(email=user_data.email)
-    if not user:
-        raise HTTPException(status_code=404)
-
-    if user.password != user_data.password:
-        raise HTTPException(status_code=500)
+    user = await authenticate_user(user_data)
 
     access_token = await create_access_token({"sub": str(user.id)})
     response.set_cookie("access_token", access_token, httponly=True)
@@ -182,74 +217,50 @@ async def price_update(request: Request):
     return {"status": "success", "message": f"Цена {currency_pair} обновлена"}
 
 
-webhook_url = "http://localhost:8000/webhook/price_update"
-socket = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/usdtercusdt@trade/usdttrcusdt@trade"
+# WebSocket URL для отслеживания цен на несколько пар
+socket = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/usdtercusdt@trade/usdtusdt@trade"
 
-previous_prices = {
-        "BTCUSDT": None,
-        "ETHUSDT": None,
-        "USDTERCUSDT": None,
-        "USDTTRCUSDT": None,
-    }
-
-
-# Функция для отправки вебхука на сервер
-def send_webhook(currency_pair: str, new_price: float):
-    data = {
-        "currency_pair": currency_pair,
-        "new_price": new_price
-    }
-    response = requests.post(webhook_url, json=data)
-    if response.status_code == 200:
-        print(f"Вебхук для {currency_pair} успешно отправлен.")
-    else:
-        print(f"Ошибка при отправке вебхука: {response.status_code}")
-
-
-# Функция для отправки уведомления пользователям (например, через e-mail или Telegram)
-async def notify_user(trading_pair: str, old_price: float, new_price: float):
-    users = get_users_for_pair(trading_pair)
-    for user in users:
-        message = (f"Уведомление пользователю: {user.email}\n"
-                   f"Цена для {trading_pair} изменилась с {old_price} на {new_price}")
-        print(message)
+# Предыдущие цены для сравнения
+previous_prices: Dict[str, float] = {
+    "BTCUSDT": None,
+    "ETHUSDT": None,
+    "USDTERCUSDT": None,
+    "USDTUSDT": None,
+}
 
 
 async def binance_ws():
-    try:
-        async with websockets.connect(socket) as websocket:
-            while True:
-                log.warning("Соединение установлено!")
-                data = await websocket.recv()
-                log.info(f"Данные получены {data}")
-                stream_data = json.loads(data)
-                if 'data' in stream_data:
-                    streams = stream_data['data']
-                    log.info(f"Streams: {streams}")
+    async with websockets.connect(socket) as websocket:
+        while True:
+            data = await websocket.recv()
+            log.warning(data)
+            stream_data = json.loads(data)
+            log.warning(f"stream_data: {stream_data}")
 
-                    if isinstance(streams, list):
-                        log.warning("Start update")
-                        for stream in streams:
-                            trading_pair = stream.get('s')  # Валютная пара
-                            new_price = stream.get('p')  # Новая цена
-                            log.info(f"Пара: {trading_pair} Цена: {new_price}")
+            if 'data' in stream_data:
+                streams = stream_data['data']
 
-                            if trading_pair and new_price:
-                                new_price = float(new_price)
-                                previous_price = previous_prices.get(trading_pair)
+                # Для каждого потока проверяем цену и оповещаем при изменении
+                trading_pair = streams.get('s')  # Валютная пара (например, BTCUSDT)
+                new_price = float(streams.get('p'))  # Новая цена
+                log.info(f"Валютная пара: {trading_pair} Новая цена: {new_price}")
 
-                                if previous_price is None:
-                                    previous_prices[trading_pair] = new_price
-                                else:
-                                    if new_price != previous_price:
-                                        log.warning(f"Цена {trading_pair} изменилась с {previous_price} на {new_price}")
-                                        await notify_user(trading_pair, previous_price, new_price)
-                                        previous_prices[trading_pair] = new_price
+                previous_price = previous_prices.get(trading_pair)
+                if previous_price is None:
+                    previous_prices[trading_pair] = new_price
+                else:
+                    if new_price != previous_price:
+                        log.info(f"Цена {trading_pair} изменилась с {previous_price} на {new_price}")
+                        await notify_user(trading_pair, previous_price, new_price)
+                        previous_prices[trading_pair] = new_price
 
-    except websockets.ConnectionClosed:
-        # Обработка ошибок соединения и переподключение
-        log.warning("Соединение потеряно, пытаемся переподключиться...")
-        await asyncio.sleep(5)
+
+async def notify_user(trading_pair: str, old_price: float, new_price: float):
+    users = await get_users_for_pair(trading_pair)
+    for user in users:
+        message = (f"Уведомление пользователю: {user.email}\n"
+                   f"Цена для {trading_pair} изменилась с {old_price} на {new_price}")
+        log.warning(message)
 
 
 if __name__ == "__main__":

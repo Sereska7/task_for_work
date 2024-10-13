@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime
 from typing import Optional
 
@@ -57,16 +58,30 @@ async def get_user(**data: dict):
         return user.scalar_one_or_none()
 
 
-async def get_users(**data: dict):
+async def get_users_for_pair(trading_pair: str):
     async with session_factory() as session:
-        request = select(User).filter_by(**data)
-        users = await session.execute(request)
-        return users.scalars().all()
+        query = None
+        # Определяем запрос в зависимости от валютной пары
+        if trading_pair == "BTC-USD":
+            query = select(User).where(User.get_BTC_USD == True)
+        elif trading_pair == "ETH-USD":
+            query = select(User).where(User.get_ETH_USD == True)
+        elif trading_pair == "USDTERC-USD":
+            query = select(User).where(User.get_USDTERC_USD == True)
+        elif trading_pair == "USDTTRC-USD":
+            query = select(User).where(User.get_USDTTRC_USD == True)
+
+        if query is not None:
+            result = await session.execute(query)
+            users = result.scalars().all()  # Получаем список пользователей
+            return users
+        return []
 
 
 async def lifespan(app: FastAPI):
     # start
     await init_db()
+    logging.basicConfig(level=logging.WARNING)
     asyncio.create_task(fetch_prices())
     yield
     # stop
@@ -130,7 +145,7 @@ async def create_alert(
         async with session.begin():
             if request.pair == "BTC-USD":
                 current_user.get_BTC_USD = request.enable
-            elif request.pair == "ETH_USD":
+            elif request.pair == "ETH-USD":
                 current_user.get_ETH_USD = request.enable
             elif request.pair == "USDTERC-USD":
                 current_user.get_USDTERC_USD = request.enable
@@ -146,11 +161,15 @@ async def create_alert(
 
 
 async def get_price(currency: str):
+    await asyncio.sleep(1)
     async with AsyncClient() as client:
         response = await client.get(
             f"https://api.coingecko.com/api/v3/simple/price?ids={currency}&vs_currencies=usd"
         )
-    return response.json().get(currency, {}).get("usd", None)
+        return response.json().get(currency, {}).get("usd", None)
+
+
+log = logging.getLogger()
 
 
 async def fetch_prices():
@@ -162,6 +181,7 @@ async def fetch_prices():
         "USDTTRC-USD": None,
     }
     while True:
+        log.warning("Цикл запущен")
         new_prices = {
             "BTC-USD": await get_price("bitcoin"),
             "ETH-USD": await get_price("ethereum"),
@@ -174,39 +194,18 @@ async def fetch_prices():
             if previous_price is None:
                 previous_prices[pair] = new_price
                 continue
-        users = await get_users()
-        for user in users:
-            if user.get_BTC_USD and new_prices['BTC-USD'] != previous_prices['BTC-USD']:
-                print(
-                    f"Уведомление пользователю: {user.email}"
-                    f"Изменение цены 'BTC-USD'!"
-                    f"Старая цена: {previous_prices['BTC-USD']} Новая цена: {new_prices['BTC-USD']}"
-                )
-            if user.get_ETH_USD and new_prices['ETH-USD'] != previous_prices['ETH-USD']:
-                print(
-                    f"Уведомление пользователю: {user.email}"
-                    f"Изменение цены 'ETH-USD'!"
-                    f"Старая цена: {previous_prices['ETH-USD']} Новая цена: {new_prices['ETH-USD']}"
-                )
-            if (
-                user.get_USDTERC_USD
-                and new_prices['USDTERC-USD'] != previous_prices['USDTERC-USD']
-            ):
-                print(
-                    f"Уведомление пользователю: {user.email}"
-                    f"Изменение цены 'USDTERC-USD'!"
-                    f"Старая цена: {previous_prices['USDTERC-USD']} Новая цена: {new_prices['USDTERC-USD']}"
-                )
-            if (
-                user.get_USDTTRC_USD
-                and new_prices['USDTTRC-USD'] != previous_prices['USDTTRC-USD']
-            ):
-                print(
-                    f"Уведомление пользователю: {user.email} "
-                    f"Изменение цены 'USDTTRC-USD'! "
-                    f"Старая цена: {previous_prices['USDTTRC-USD']} Новая цена: {new_prices['USDTTRC-USD']}"
-                )
+            if previous_price != new_price:
+                log.info(f"Название: {pair} Старая цена: {previous_price} Новая цена: {new_price}")
+                await notify_user(pair, previous_price, new_price)
         await asyncio.sleep(60)
+
+
+async def notify_user(trading_pair: str, old_price: float, new_price: float):
+    users = await get_users_for_pair(trading_pair)
+    for user in users:
+        message = (f"Уведомление пользователю: {user.email}\n"
+                   f"Цена для {trading_pair} изменилась с {old_price} на {new_price}")
+        log.warning(message)
 
 
 if __name__ == "__main__":

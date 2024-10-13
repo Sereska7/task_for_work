@@ -10,13 +10,7 @@ from fastapi.security import OAuth2PasswordBearer
 from httpx import AsyncClient
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import (
-    Integer,
-    String,
-    DateTime,
-    select,
-    Boolean
-)
+from sqlalchemy import Integer, String, DateTime, select, Boolean
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column, declarative_base
 
@@ -81,15 +75,23 @@ async def authenticate_user(data_user: SUserLog):
 
 async def add_user():
     data = [
-        {"email": "user_1@example.com", "password": "password", "created_at": datetime.now()},
-        {"email": "user_2@example.com", "password": "password", "created_at": datetime.now()}
+        {
+            "email": "user_1@example.com",
+            "password": "password",
+            "created_at": datetime.now(),
+        },
+        {
+            "email": "user_2@example.com",
+            "password": "password",
+            "created_at": datetime.now(),
+        },
     ]
     async with session_factory() as session:
         for person in data:
             user = User(
                 email=person["email"],
                 password=get_password_hash(person["password"]),
-                created_at=person["created_at"]
+                created_at=person["created_at"],
             )
             session.add(user)
             await session.commit()
@@ -231,7 +233,9 @@ async def fetch_prices():
                 previous_prices[pair] = new_price
                 continue
             if previous_price != new_price:
-                log.info(f"Название: {pair} Старая цена: {previous_price} Новая цена: {new_price}")
+                log.info(
+                    f"Название: {pair} Старая цена: {previous_price} Новая цена: {new_price}"
+                )
                 await notify_user(pair, previous_price, new_price)
         await asyncio.sleep(60)
 
@@ -239,8 +243,10 @@ async def fetch_prices():
 async def notify_user(trading_pair: str, old_price: float, new_price: float):
     users = await get_users_for_pair(trading_pair)
     for user in users:
-        message = (f"Уведомление пользователю: {user.email}\n"
-                   f"Цена для {trading_pair} изменилась с {old_price} на {new_price}")
+        message = (
+            f"Уведомление пользователю: {user.email}\n"
+            f"Цена для {trading_pair} изменилась с {old_price} на {new_price}"
+        )
         log.warning(message)
 
 

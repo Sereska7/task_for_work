@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 import requests
 import websockets
@@ -32,6 +33,8 @@ engine = create_async_engine(DB_URL)
 session_factory = async_sessionmaker(engine)
 Base = declarative_base()
 
+log = logging.getLogger()
+
 
 class User(Base):
     __tablename__ = "users"
@@ -60,16 +63,30 @@ async def get_user(**data: str | int):
         return user.scalar_one_or_none()
 
 
-async def get_users(**data: str | int | bool):
+async def get_users_for_pair(trading_pair: str):
     async with session_factory() as session:
-        request = select(User).filter_by(**data)
-        users = await session.execute(request)
-        return users.scalars().all()
+        query = None
+        # Определяем запрос в зависимости от валютной пары
+        if trading_pair == "BTCUSDT":
+            query = select(User).where(User.get_BTC_USD == True)
+        elif trading_pair == "ETHUSDT":
+            query = select(User).where(User.get_ETH_USD == True)
+        elif trading_pair == "USDTERCUSDT":
+            query = select(User).where(User.get_USDTERC_USD == True)
+        elif trading_pair == "USDTTRCUSDT":
+            query = select(User).where(User.get_USDTTRC_USD == True)
+
+        if query is not None:
+            result = await session.execute(query)
+            users = result.scalars().all()  # Получаем список пользователей
+            return users
+        return []
 
 
 async def lifespan(app: FastAPI):
     # start
     await init_db()
+    logging.basicConfig(level=logging.INFO)
     asyncio.create_task(binance_ws())
     yield
     # stop
@@ -190,52 +207,49 @@ def send_webhook(currency_pair: str, new_price: float):
 
 
 # Функция для отправки уведомления пользователям (например, через e-mail или Telegram)
-async def notify_user(user_email: str, currency_pair: str, old_price: float, new_price: float):
-    message = (f"Уведомление пользователю: {user_email}\n"
-               f"Цена для {currency_pair} изменилась с {old_price} на {new_price}")
-    print(message)
+async def notify_user(trading_pair: str, old_price: float, new_price: float):
+    users = get_users_for_pair(trading_pair)
+    for user in users:
+        message = (f"Уведомление пользователю: {user.email}\n"
+                   f"Цена для {trading_pair} изменилась с {old_price} на {new_price}")
+        print(message)
 
 
 async def binance_ws():
-    while True:
-        try:
-            async with websockets.connect(socket) as websocket:
+    try:
+        async with websockets.connect(socket) as websocket:
+            while True:
+                log.warning("Соединение установлено!")
                 data = await websocket.recv()
+                log.info(f"Данные получены {data}")
                 stream_data = json.loads(data)
                 if 'data' in stream_data:
-                    stream = stream_data['data']
+                    streams = stream_data['data']
+                    log.info(f"Streams: {streams}")
 
-                    # Получаем название валютной пары (BTCUSDT, ETHUSDT и т.д.)
-                    trading_pair = stream.get('s')  # Валютная пара
-                    new_price = stream.get('p')  # Новая цена
+                    if isinstance(streams, list):
+                        log.warning("Start update")
+                        for stream in streams:
+                            trading_pair = stream.get('s')  # Валютная пара
+                            new_price = stream.get('p')  # Новая цена
+                            log.info(f"Пара: {trading_pair} Цена: {new_price}")
 
-                    if trading_pair and new_price:
-                        new_price = float(new_price)  # Преобразуем строку в число
-                        previous_price = previous_prices.get(trading_pair)
+                            if trading_pair and new_price:
+                                new_price = float(new_price)
+                                previous_price = previous_prices.get(trading_pair)
 
-                        if previous_price is None:
-                            previous_prices[trading_pair] = new_price
-                        else:
-                            if new_price != previous_price:
-                                print(f"Цена {trading_pair} изменилась с {previous_price} на {new_price}")
-                                # send_webhook(trading_pair, new_price)
+                                if previous_price is None:
+                                    previous_prices[trading_pair] = new_price
+                                else:
+                                    if new_price != previous_price:
+                                        log.warning(f"Цена {trading_pair} изменилась с {previous_price} на {new_price}")
+                                        await notify_user(trading_pair, previous_price, new_price)
+                                        previous_prices[trading_pair] = new_price
 
-                                users = await get_users()
-                                for user in users:
-                                    if trading_pair == "BTCUSDT" and user.get_BTC_USD:
-                                        await notify_user(user.email, trading_pair, previous_price, new_price)
-                                    if trading_pair == "ETHUSDT" and user.get_ETH_USD:
-                                        await notify_user(user.email, trading_pair, previous_price, new_price)
-                                    if trading_pair == "USDTERCUSDT" and user.get_USDTERC_USD:
-                                        await notify_user(user.email, trading_pair, previous_price, new_price)
-                                    if trading_pair == "USDTTRCUSDT" and user.get_USDTTRC_USD:
-                                        await notify_user(user.email, trading_pair, previous_price, new_price)
-                                # Обновляем предыдущую цену
-                                previous_prices[trading_pair] = new_price
-        except websockets.ConnectionClosed:
-            # Обработка ошибок соединения и переподключение
-            print("Соединение потеряно, пытаемся переподключиться...")
-            await asyncio.sleep(5)
+    except websockets.ConnectionClosed:
+        # Обработка ошибок соединения и переподключение
+        log.warning("Соединение потеряно, пытаемся переподключиться...")
+        await asyncio.sleep(5)
 
 
 if __name__ == "__main__":

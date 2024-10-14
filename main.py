@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Any
 
 import jwt
 import uvicorn
@@ -10,16 +10,16 @@ from fastapi.security import OAuth2PasswordBearer
 from httpx import AsyncClient
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import Integer, String, DateTime, select, Boolean
+from sqlalchemy import Integer, String, DateTime, select, Boolean, Select, Update
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column, declarative_base
+from starlette import status
 
 DB_URL = "postgresql+asyncpg://postgres:wer255678@localhost:5432/task_db"
 SECRET_KEY = "secret_key"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
 
 engine = create_async_engine(DB_URL)
 session_factory = async_sessionmaker(engine)
@@ -48,7 +48,7 @@ class SUserLog(BaseModel):
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
-        # Асинхронный вызов создания всех таблиц
+        # Создание всех таблиц
         await conn.run_sync(Base.metadata.create_all)
 
 
@@ -65,11 +65,12 @@ def verify_password(plain_password: str, hashed_password: str):
 
 async def authenticate_user(data_user: SUserLog):
     user = await get_user(email=data_user.email)
+
     if not user:
-        raise HTTPException(status_code=404, detail="Not found")
-    else:
-        if not verify_password(data_user.password, user.password):
-            raise HTTPException(status_code=400)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    if not verify_password(data_user.password, user.password):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+
     return user
 
 
@@ -98,16 +99,16 @@ async def add_user():
             return user
 
 
-async def get_user(**data: dict):
+async def get_user(**kwargs) -> Any | None:
     async with session_factory() as session:
-        request = select(User).filter_by(**data)
+        request = select(User).filter_by(**kwargs)
         user = await session.execute(request)
         return user.scalar_one_or_none()
 
 
 async def get_users_for_pair(trading_pair: str):
     async with session_factory() as session:
-        query = None
+        query: Select = Select()
         # Определяем запрос в зависимости от валютной пары
         if trading_pair == "BTC-USD":
             query = select(User).where(User.get_BTC_USD == True)
@@ -118,9 +119,9 @@ async def get_users_for_pair(trading_pair: str):
         elif trading_pair == "USDTTRC-USD":
             query = select(User).where(User.get_USDTTRC_USD == True)
 
-        if query is not None:
+        if query != Select():
             result = await session.execute(query)
-            users = result.scalars().all()  # Получаем список пользователей
+            users = list(result.scalars().all())  # Получаем список пользователей
             return users
         return []
 
@@ -146,16 +147,17 @@ async def create_access_token(data: dict):
 
 async def get_token_from_request(request: Request):
     token = request.cookies.get("access_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="No authentication token provided")
     return token
 
 
 async def get_current_user(token: Optional[str] = Depends(get_token_from_request)):
-    if not token:
-        return HTTPException(status_code=401, detail="No authentication token provided")
-
     payload = jwt.decode(token, SECRET_KEY, ALGORITHM)
     user_id = payload.get("sub")
     user = await get_user(id=int(user_id))
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
     return user
 
 
@@ -169,37 +171,29 @@ async def login_user(user_data: SUserLog, response: Response):
 
 
 class SetAlertRequest(BaseModel):
-    pair: str
-    enable: bool
+    btc_usd: bool
+    eth_usd: bool
+    usdterc: bool
+    usdttrc: bool
 
 
-@main_app.post("/set_alert")
+@main_app.put("/set_alert")
 async def create_alert(
-    request: SetAlertRequest, current_user: User = Depends(get_current_user)
+        data: SetAlertRequest, current_user: User = Depends(get_current_user)
 ):
-    if not current_user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
     async with session_factory() as session:
-        async with session.begin():
-            if request.pair == "BTC-USD":
-                current_user.get_BTC_USD = request.enable
-            elif request.pair == "ETH-USD":
-                current_user.get_ETH_USD = request.enable
-            elif request.pair == "USDTERC-USD":
-                current_user.get_USDTERC_USD = request.enable
-            elif request.pair == "USDTTRC-USD":
-                current_user.get_USDTTRC_USD = request.enable
-            else:
-                raise HTTPException(status_code=400, detail="Invalid currency pair")
-            session.add(current_user)
+        query = Update(User).where(User.id == current_user.id).values(
+            get_BTC_USD=data.btc_usd,
+            get_ETH_USD=data.eth_usd,
+            get_USDTERC_USD=data.usdterc,
+            get_USDTTRC_USD=data.usdttrc
+        )
+        await session.execute(query)
         await session.commit()
-    return {
-        "message": f"Alert for {request.pair} {'enabled' if request.enable else 'disabled'} successfully"
-    }
+    return HTTPException(status_code=status.HTTP_200_OK, detail="Data update")
 
 
 async def get_price(currency: str):
-    await asyncio.sleep(1)
     async with AsyncClient() as client:
         response = await client.get(
             f"https://api.coingecko.com/api/v3/simple/price?ids={currency}&vs_currencies=usd"
@@ -220,19 +214,27 @@ async def fetch_prices():
     }
     while True:
         log.warning("Цикл запущен")
+
+        btc_usd = await get_price("bitcoin")
+        await asyncio.sleep(1)
+        etc_usd = await get_price("bitcoin")
+        await asyncio.sleep(1)
+        usdterc_usd = await get_price("bitcoin")
+        await asyncio.sleep(1)
+        usdttrc_usd = await get_price("bitcoin")
+
         new_prices = {
-            "BTC-USD": await get_price("bitcoin"),
-            "ETH-USD": await get_price("ethereum"),
-            "USDTERC-USD": await get_price("usd-coin"),
-            "USDTTRC-USD": await get_price("tether"),
+            "BTC-USD": btc_usd,
+            "ETH-USD": etc_usd,
+            "USDTERC-USD": usdterc_usd,
+            "USDTTRC-USD": usdttrc_usd,
         }
 
         for pair, new_price in new_prices.items():
             previous_price = previous_prices.get(pair)
-            if previous_price is None:
-                previous_prices[pair] = new_price
-                continue
+
             if previous_price != new_price:
+                previous_prices[pair] = new_price
                 log.info(
                     f"Название: {pair} Старая цена: {previous_price} Новая цена: {new_price}"
                 )

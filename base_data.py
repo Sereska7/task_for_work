@@ -2,10 +2,9 @@ import os
 
 
 from datetime import datetime
-from typing import Any
-
 from dotenv import load_dotenv
-from sqlalchemy import select, Numeric, DECIMAL, Integer, ForeignKey, DateTime, String
+from pydantic import EmailStr
+from sqlalchemy import select, Numeric, DECIMAL, Integer, ForeignKey, DateTime, String, delete
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Mapped, relationship, mapped_column, declarative_base
 
@@ -19,6 +18,7 @@ session_factory = async_sessionmaker(engine)
 Base = declarative_base()
 
 
+# Описание модели пользователя
 class User(Base):
     __tablename__ = "users"
 
@@ -31,7 +31,7 @@ class User(Base):
     alarm: Mapped["AlarmPrice"] = relationship(back_populates="user")
 
 
-# Описание модели пары валю
+# Описание модели валютных пар
 class Pair(Base):
     __tablename__ = "pairs"
 
@@ -40,8 +40,7 @@ class Pair(Base):
 
     alarm: Mapped["AlarmPrice"] = relationship(back_populates="pair")
 
-
-# Описание модели
+# Описание модели уведомление на цену валютных пар
 class AlarmPrice(Base):
     __tablename__ = "alarm_prices"
 
@@ -56,25 +55,37 @@ class AlarmPrice(Base):
 
 async def init_db():
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)  # Удаление всех таблиц (для тестов)
         await conn.run_sync(Base.metadata.create_all)  # Создание всех таблиц
+
+# Добавление нового пользователя в базу данных
+async def add_user(email: EmailStr, password: str, date_reg: datetime):
+    async with session_factory() as session:
+        new_user = User(
+            email=email,
+            password=password,
+            created_at=date_reg
+        )
+        session.add(new_user)
+        await session.commit()
+        return new_user
 
 
 # Получение пользователя из базы данных по указанным критериям
-async def get_user(**kwargs) -> Any | None:
+async def get_user(**kwargs):
     async with session_factory() as session:
         request = select(User).filter_by(**kwargs)
         user = await session.execute(request)
         return user.scalar_one_or_none()
 
-
+# Получение данных валютный пары, по названию
 async def get_pair(pair: str):
     async with session_factory() as session:
-        query = select(Pair).where(Pair.name == pair)
-        pair = await session.execute(query)
+        request = select(Pair).where(Pair.name == pair)
+        pair = await session.execute(request)
         return pair.scalar_one_or_none()
 
 
+# Добавление нового 'колокольчика' для цены валютной пары
 async def add_alarm_for_price(pair_id: int, user_id: int, price: float):
     async with session_factory() as session:
         new_alarm = AlarmPrice(
@@ -86,8 +97,17 @@ async def add_alarm_for_price(pair_id: int, user_id: int, price: float):
         await session.commit()
         return new_alarm
 
+# Удаление 'колокольчика' на цену для валютной пары
+async def remove_alarm(alarm_id):
+    async with session_factory() as session:
+        stmt = delete(AlarmPrice).where(AlarmPrice.id == alarm_id)
+        await session.execute(stmt)
+        await session.commit()
 
+
+# Получение все 'колокольчиков' для валютных пар
 async def get_alarm_prices():
     async with session_factory() as session:
-        alarm_prices = await session.execute(select(AlarmPrice))
-        return alarm_prices.scalars().all()
+        alarm_prices = await session.execute(select(AlarmPrice.__table__.columns))
+        return alarm_prices.mappings().all()
+
